@@ -219,12 +219,15 @@ export function useSelectionPopoverDismiss({
   popoverRef,
   onDismiss,
   onScroll,
+  dismissOnContextMenu = true,
 }: {
   active: boolean
   popoverRef: ElementRef
   onDismiss: () => void
   /** Override scroll handling for selections that should survive viewport movement. */
   onScroll?: () => void
+  /** Keep the popover open when a custom context menu repositions it. */
+  dismissOnContextMenu?: boolean
 }) {
   useEffect(() => {
     if (!active) return
@@ -242,7 +245,7 @@ export function useSelectionPopoverDismiss({
         return
       }
       if (isContextMenuPointer) {
-        onDismiss()
+        if (dismissOnContextMenu) onDismiss()
         return
       }
 
@@ -250,7 +253,7 @@ export function useSelectionPopoverDismiss({
     }
 
     const handleContextMenu = () => {
-      onDismiss()
+      if (dismissOnContextMenu) onDismiss()
     }
 
     const handleScroll = () => {
@@ -266,5 +269,5 @@ export function useSelectionPopoverDismiss({
       document.removeEventListener('contextmenu', handleContextMenu, true)
       document.removeEventListener('scroll', handleScroll, true)
     }
-  }, [active, onDismiss, onScroll, popoverRef])
+  }, [active, dismissOnContextMenu, onDismiss, onScroll, popoverRef])
 }

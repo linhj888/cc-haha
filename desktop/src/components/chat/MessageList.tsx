@@ -23,7 +23,6 @@ import { interruptedTeamNameOf, useTeamPlanStore } from '../../stores/teamPlanSt
 import { useUIStore } from '../../stores/uiStore'
 import { useChatAppearanceStore } from '../../stores/chatAppearanceStore'
 import { t as translateNow, useTranslation } from '../../i18n'
-import { prefersSelectionMenuAbove } from '../../stores/selectionMenuPlacementStore'
 import type { TranslationKey } from '../../i18n/locales/en'
 import { UserMessage } from './UserMessage'
 import { AssistantMessage } from './AssistantMessage'
@@ -76,7 +75,7 @@ import {
 } from '../../lib/teamLifecycleScope'
 import { Button } from '@/components/ui/Button'
 import { ActionDialog, type ActionDialogAction } from '@/components/ui/ActionDialog'
-import { clearWindowSelection, getSelectionPopoverPosition, useSelectionPopoverDismiss } from '../../hooks/useSelectionPopoverDismiss'
+import { clearWindowSelection, useSelectionPopoverDismiss } from '../../hooks/useSelectionPopoverDismiss'
 import {
   getHeightsForSession,
   getMetricsForSession,
@@ -175,31 +174,22 @@ const BUSINESS_ERRORS_WITH_RAW_DETAIL: ReadonlySet<string> = new Set([
   'upstream_stream_interrupted',
 ])
 
-const CHAT_SELECTION_MENU_OFFSET = 10
 const CHAT_SELECTION_MENU_WIDTH = 360
 const CHAT_SELECTION_MENU_HEIGHT = 44
+const CHAT_CONTEXT_MENU_MARGIN = 12
 
 function getElementForNode(node: Node | null): Element | null {
   if (!node) return null
   return node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement
 }
 
-function getChatSelectionPosition(
-  range: Range,
-  root: HTMLElement,
-  selection: Selection,
-  pointer: { clientX: number; clientY: number },
-) {
-  return getSelectionPopoverPosition(range, root, {
-    menuWidth: CHAT_SELECTION_MENU_WIDTH,
-    menuHeight: CHAT_SELECTION_MENU_HEIGHT,
-    offset: CHAT_SELECTION_MENU_OFFSET,
-    fallbackPointer: pointer,
-    selectionFocus: { node: selection.focusNode, offset: selection.focusOffset },
-    // Read from the store: the settled-selection listener that calls this is not
-    // a render, so there is no hook to subscribe with.
-    preferAbove: prefersSelectionMenuAbove(),
-  })
+function getContextMenuPosition(pointer: SelectionPointer) {
+  const maxX = Math.max(CHAT_CONTEXT_MENU_MARGIN, window.innerWidth - CHAT_SELECTION_MENU_WIDTH - CHAT_CONTEXT_MENU_MARGIN)
+  const maxY = Math.max(CHAT_CONTEXT_MENU_MARGIN, window.innerHeight - CHAT_SELECTION_MENU_HEIGHT - CHAT_CONTEXT_MENU_MARGIN)
+  return {
+    x: Math.max(CHAT_CONTEXT_MENU_MARGIN, Math.min(pointer.clientX, maxX)),
+    y: Math.max(CHAT_CONTEXT_MENU_MARGIN, Math.min(pointer.clientY, maxY)),
+  }
 }
 
 function getChatSelectionFromContainer(
@@ -221,24 +211,9 @@ function getChatSelectionFromContainer(
   if (!text) return null
 
   return {
-    ...getChatSelectionPosition(range, root, selection, pointer),
+    ...getContextMenuPosition(pointer),
     text,
   }
-}
-
-function getSelectionPointer(event: SelectionPointer): SelectionPointer {
-  return {
-    clientX: event.clientX,
-    clientY: event.clientY,
-  }
-}
-
-function isPrimarySelectionPointer(event: Pick<PointerEvent, 'button' | 'ctrlKey' | 'pointerType'>) {
-  return event.button === 0 && !(event.pointerType === 'mouse' && event.ctrlKey)
-}
-
-function isKeyboardSelectionKey(event: KeyboardEvent) {
-  return event.shiftKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)
 }
 
 function ChatSelectionMenu({
@@ -257,10 +232,11 @@ function ChatSelectionMenu({
   return createPortal(
     <div ref={popoverRef} role="toolbar" aria-label={t('chat.selectionActions')}
       onMouseDown={event => { if (event.button === 0 && !event.ctrlKey) event.preventDefault() }}
-      className="fixed z-[var(--z-popover)] inline-flex max-w-[calc(100vw-24px)] items-center rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] p-1 shadow-[var(--shadow-overlay)]"
+      onContextMenu={event => event.preventDefault()}
+      className="fixed z-[var(--z-popover)] flex min-w-[180px] flex-col overflow-hidden rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] p-1 shadow-[var(--shadow-dropdown)]"
       style={{ left: selection.x, top: selection.y }}>
-      <Button variant="ghost" onClick={onAdd}>{t('chat.addSelectionToChat')}</Button>
-      {onSideChat && <Button variant="ghost" onClick={onSideChat}>{t('chat.askSelectionInSideChat')}</Button>}
+      <Button variant="ghost" size="base" block className="justify-start whitespace-nowrap" onClick={onAdd}>{t('chat.addSelectionToChat')}</Button>
+      {onSideChat && <Button variant="ghost" size="base" block className="justify-start whitespace-nowrap" onClick={onSideChat}>{t('chat.askSelectionInSideChat')}</Button>}
     </div>, document.body,
   )
 }
@@ -566,11 +542,6 @@ function SelectableChatMessage({
   const isLean = useSessionStore(state => state.sessions.some(session => session.id === sessionId && session.agentProfile === 'lean'))
   const rootRef = useRef<HTMLDivElement>(null)
   const selectionMenuRef = useRef<HTMLDivElement>(null)
-  const lastSelectionPointerRef = useRef<SelectionPointer | null>(null)
-  const selectionGestureEpochRef = useRef(0)
-  const selectionStartedInsideRef = useRef(false)
-  const selectionUpdateAuthorizedRef = useRef(false)
-  const selectionUpdateFrameRef = useRef<number | null>(null)
   const addReference = useWorkspaceChatContextStore((state) => state.addReference)
   const [selectionMenu, setSelectionMenu] = useState<(ChatSelectionState & { sessionId: string }) | null>(null)
   const currentSelectionMenu = selectionMenu?.sessionId === sessionId ? selectionMenu : null
@@ -579,124 +550,40 @@ function SelectableChatMessage({
     ? t('chat.assistantMessageReference')
     : t('chat.userMessageReference')
 
-  const cancelPendingSelectionMenuUpdate = useCallback(() => {
-    selectionGestureEpochRef.current += 1
-    if (selectionUpdateFrameRef.current !== null) {
-      window.cancelAnimationFrame(selectionUpdateFrameRef.current)
-      selectionUpdateFrameRef.current = null
-    }
-  }, [])
-
   // A transcript entry can have the same id and content in multiple sessions.
-  // Invalidate its gesture before another frame can commit into the new session.
+  // Clear the open menu before the same entry reappears in another session.
   useLayoutEffect(() => {
-    cancelPendingSelectionMenuUpdate()
     setSelectionMenu(null)
-    lastSelectionPointerRef.current = null
-    selectionStartedInsideRef.current = false
-    selectionUpdateAuthorizedRef.current = false
-  }, [cancelPendingSelectionMenuUpdate, content, messageId, sessionId])
+  }, [content, messageId, sessionId])
 
   const dismissSelectionMenu = useCallback(() => {
     setSelectionMenu(null)
   }, [])
 
-  const queueSelectionMenuUpdate = useCallback((pointer?: SelectionPointer) => {
-    if (pointer) lastSelectionPointerRef.current = pointer
-
-    if (selectionUpdateFrameRef.current !== null) {
-      window.cancelAnimationFrame(selectionUpdateFrameRef.current)
-    }
-
-    const gestureEpoch = selectionGestureEpochRef.current
-    selectionUpdateFrameRef.current = window.requestAnimationFrame(() => {
-      if (gestureEpoch !== selectionGestureEpochRef.current) {
-        selectionUpdateFrameRef.current = null
-        return
-      }
-      selectionUpdateFrameRef.current = window.requestAnimationFrame(() => {
-        selectionUpdateFrameRef.current = null
-        if (gestureEpoch !== selectionGestureEpochRef.current || !selectionUpdateAuthorizedRef.current) return
-
-        const root = rootRef.current
-        const rootRect = root?.getBoundingClientRect()
-        const fallbackPointer = lastSelectionPointerRef.current ?? {
-          clientX: (rootRect?.left ?? 0) + 24,
-          clientY: (rootRect?.top ?? 0) + 24,
-        }
-        const selection = getChatSelectionFromContainer(root, fallbackPointer)
-        setSelectionMenu(selection && sessionId ? { ...selection, sessionId } : null)
-      })
-    })
-  }, [sessionId])
-
   useEffect(() => {
-    return () => {
-      if (selectionUpdateFrameRef.current !== null) {
-        window.cancelAnimationFrame(selectionUpdateFrameRef.current)
-      }
-    }
-  }, [])
-
-  useEffect(() => {
-    const handlePointerDown = (event: PointerEvent) => {
-      cancelPendingSelectionMenuUpdate()
+    const handleContextMenu = (event: MouseEvent) => {
       const root = rootRef.current
       const target = event.target
-      const startsInside = isPrimarySelectionPointer(event)
-        && target instanceof Node
-        && Boolean(root?.contains(target))
-      selectionStartedInsideRef.current = startsInside
-      selectionUpdateAuthorizedRef.current = startsInside
-      if (startsInside) lastSelectionPointerRef.current = getSelectionPointer(event)
+      const selection = root && target instanceof Node && root.contains(target)
+        ? getChatSelectionFromContainer(root, { clientX: event.clientX, clientY: event.clientY })
+        : null
+      if (!selection) {
+        setSelectionMenu(null)
+        return
+      }
+      event.preventDefault()
+      setSelectionMenu(sessionId ? { ...selection, sessionId } : null)
     }
 
-    const handlePointerUp = (event: PointerEvent) => {
-      if (!selectionStartedInsideRef.current || !isPrimarySelectionPointer(event)) return
-      selectionStartedInsideRef.current = false
-      selectionUpdateAuthorizedRef.current = true
-      queueSelectionMenuUpdate(getSelectionPointer(event))
-    }
-
-    const handleSelectionChange = () => {
-      if (selectionStartedInsideRef.current || !selectionUpdateAuthorizedRef.current) return
-      queueSelectionMenuUpdate()
-    }
-
-    const handleKeyUp = (event: KeyboardEvent) => {
-      if (!isKeyboardSelectionKey(event)) return
-      cancelPendingSelectionMenuUpdate()
-      lastSelectionPointerRef.current = null
-      selectionStartedInsideRef.current = false
-      selectionUpdateAuthorizedRef.current = true
-      queueSelectionMenuUpdate()
-    }
-
-    const handleContextMenu = () => {
-      cancelPendingSelectionMenuUpdate()
-      selectionStartedInsideRef.current = false
-      selectionUpdateAuthorizedRef.current = false
-      setSelectionMenu(null)
-    }
-
-    document.addEventListener('pointerdown', handlePointerDown, true)
-    document.addEventListener('pointerup', handlePointerUp, true)
-    document.addEventListener('selectionchange', handleSelectionChange)
-    document.addEventListener('keyup', handleKeyUp, true)
     document.addEventListener('contextmenu', handleContextMenu, true)
-    return () => {
-      document.removeEventListener('pointerdown', handlePointerDown, true)
-      document.removeEventListener('pointerup', handlePointerUp, true)
-      document.removeEventListener('selectionchange', handleSelectionChange)
-      document.removeEventListener('keyup', handleKeyUp, true)
-      document.removeEventListener('contextmenu', handleContextMenu, true)
-    }
-  }, [cancelPendingSelectionMenuUpdate, queueSelectionMenuUpdate])
+    return () => document.removeEventListener('contextmenu', handleContextMenu, true)
+  }, [sessionId])
 
   useSelectionPopoverDismiss({
     active: Boolean(currentSelectionMenu),
     popoverRef: selectionMenuRef,
     onDismiss: dismissSelectionMenu,
+    dismissOnContextMenu: false,
   })
 
   const addCurrentSelectionToChat = useCallback(() => {
