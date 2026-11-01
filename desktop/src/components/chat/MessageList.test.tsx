@@ -35,10 +35,6 @@ import { useWorkspaceStore } from '../../stores/workspaceStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { initializeChatAppearance, useChatAppearanceStore } from '../../stores/chatAppearanceStore'
 import { CHAT_APPEARANCE_STORAGE_KEY } from '../../lib/chatAppearance'
-import {
-  DEFAULT_SELECTION_MENU_PLACEMENT,
-  useSelectionMenuPlacementStore,
-} from '../../stores/selectionMenuPlacementStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useSideChatStore } from '../../stores/sideChatStore'
 import { useTabStore } from '../../stores/tabStore'
@@ -207,29 +203,21 @@ function prepareMessageTextSelection(
   return selectableRoot ?? element
 }
 
+const CONTEXT_MENU_POINT = { clientX: 240, clientY: 120 }
+
 async function selectMessageText(
   element: Element,
   text: string,
   rect: Partial<DOMRect> = {},
+  point: { clientX: number; clientY: number } = CONTEXT_MENU_POINT,
 ) {
   prepareMessageTextSelection(element, text, rect)
 
   await act(async () => {
-    fireSelectionPointerEvent(element, 'down', {
-      button: 0,
-      clientX: rect.left ?? 160,
-      clientY: rect.top ?? 80,
-      pointerId: 1,
-      pointerType: 'mouse',
-    })
-    fireSelectionPointerEvent(element, 'up', {
-      button: 0,
-      clientX: rect.right ?? 280,
-      clientY: rect.bottom ?? 98,
-      pointerId: 1,
-      pointerType: 'mouse',
-    })
-    fireEvent.mouseUp(element, { clientX: 260, clientY: 104 })
+    // Right-clicking a real message first closes any menu another message left
+    // open, then opens this message's actions at the pointer.
+    fireEvent.pointerDown(element, { button: 2, clientX: point.clientX, clientY: point.clientY })
+    fireEvent.contextMenu(element, point)
     await Promise.resolve()
   })
   await waitForSelectionMenuUpdate()
@@ -303,23 +291,18 @@ async function selectAcrossMessageText(
   window.getSelection()?.addRange(range)
 
   await act(async () => {
-    fireSelectionPointerEvent(startElement, 'down', {
-      button: 0,
-      clientX: rect.left ?? 160,
-      clientY: rect.top ?? 80,
-      pointerId: 1,
-      pointerType: 'mouse',
+    fireEvent.pointerDown(endElement, {
+      button: 2,
+      clientX: CONTEXT_MENU_POINT.clientX,
+      clientY: CONTEXT_MENU_POINT.clientY,
     })
-    fireSelectionPointerEvent(endElement, 'up', {
-      button: 0,
-      clientX: rect.right ?? 520,
-      clientY: rect.bottom ?? 150,
-      pointerId: 1,
-      pointerType: 'mouse',
-    })
+    fireEvent.contextMenu(endElement, CONTEXT_MENU_POINT)
     await Promise.resolve()
   })
   await waitForSelectionMenuUpdate()
+  await waitFor(() => {
+    expect(screen.getByRole('button', { name: 'Add to chat' })).toBeTruthy()
+  })
 }
 
 async function expandChangedFileCards() {
@@ -338,7 +321,6 @@ describe('MessageList nested tool calls', () => {
     useSessionStore.setState({ sessions: [], activeSessionId: null, isLoading: false, error: null })
     useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState() } })
     useTeamStore.getState().clearTeam()
-    useSelectionMenuPlacementStore.setState({ placement: DEFAULT_SELECTION_MENU_PLACEMENT })
     useWorkspaceChatContextStore.setState(useWorkspaceChatContextStore.getInitialState(), true)
     // The workspace panel store is a shared singleton; reset it so preview tabs opened by
     // one test (clicking a change-card row) don't dedupe/leak into the next test.
@@ -4015,26 +3997,46 @@ describe('MessageList nested tool calls', () => {
     expect(retainedAction).toBeNull()
   })
 
-  it.each([0, 1])('cancels queued selection updates when switching sessions after %i animation frames', async (frames) => {
-    const content = 'Shared pending selection.'
-    const messages: UIMessage[] = [{ id: 'shared-message', type: 'assistant_text', content, timestamp: 1 }]
+  it('does not show selection actions until the message is right-clicked', async () => {
+    const content = 'Selecting this reply should stay quiet.'
     useChatStore.setState({ sessions: {
-      [ACTIVE_TAB]: makeSessionState({ messages }),
-      destination: makeSessionState({ messages }),
+      [ACTIVE_TAB]: makeSessionState({ messages: [{ id: 'assistant-1', type: 'assistant_text', content, timestamp: 1 }] }),
     } })
     render(<MessageList />)
+
     const element = screen.getByText(content)
-    prepareMessageTextSelection(element, 'pending selection')
-    const pointer = { button: 0, clientX: 180, clientY: 88, pointerId: 1, pointerType: 'mouse' }
-    fireSelectionPointerEvent(element, 'down', pointer)
-    fireSelectionPointerEvent(element, 'up', pointer)
-    if (frames) await waitForProgrammaticScrollReset()
-    act(() => useTabStore.setState({ activeTabId: 'destination' }))
-    fireEvent(document, new Event('selectionchange'))
+    prepareMessageTextSelection(element, 'should stay quiet')
+    await act(async () => {
+      fireSelectionPointerEvent(element, 'down', {
+        button: 0,
+        clientX: 180,
+        clientY: 88,
+        pointerId: 1,
+        pointerType: 'mouse',
+      })
+      fireSelectionPointerEvent(element, 'up', {
+        button: 0,
+        clientX: 360,
+        clientY: 104,
+        pointerId: 1,
+        pointerType: 'mouse',
+      })
+      document.dispatchEvent(new Event('selectionchange'))
+      await Promise.resolve()
+    })
     await waitForSelectionMenuUpdate()
+
     expect(screen.queryByRole('button', { name: 'Add to chat' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Ask in side chat' })).toBeNull()
-    expect(useWorkspaceChatContextStore.getState().referencesBySession).toEqual({})
+    expect(window.getSelection()?.toString()).toBe('should stay quiet')
+
+    await act(async () => {
+      fireEvent.contextMenu(element, { clientX: 320, clientY: 96 })
+    })
+    await waitForSelectionMenuUpdate()
+
+    expect(screen.getByRole('button', { name: 'Add to chat' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Ask in side chat' })).toBeTruthy()
   })
 
   it('opens a side chat with a selected quote without adding it to the main composer', async () => {
@@ -4072,8 +4074,8 @@ describe('MessageList nested tool calls', () => {
     await selectMessageText(userText, 'workspace selection behavior')
     const floatingAddButton = screen.getByRole('button', { name: 'Add to chat' })
 
-    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('40px')
-    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('26px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('240px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('120px')
 
     fireEvent.click(floatingAddButton)
 
@@ -4090,14 +4092,14 @@ describe('MessageList nested tool calls', () => {
     expect(window.getSelection()?.toString()).toBe('')
   })
 
-  it('cancels a pending Add to chat update when the native context menu opens', async () => {
+  it('leaves the native context menu alone when nothing is selected', async () => {
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
           messages: [{
             id: 'assistant-1',
             type: 'assistant_text',
-            content: 'Right-click should copy this selected reply.',
+            content: 'Right-click without a selection keeps native actions.',
             timestamp: 1,
           }],
         }),
@@ -4106,48 +4108,17 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
-    const assistantText = screen.getByText(/Right-click should copy/)
-    prepareMessageTextSelection(assistantText, 'copy this selected reply')
-
-    await act(async () => {
-      fireSelectionPointerEvent(assistantText, 'down', {
-        button: 0,
-        clientX: 180,
-        clientY: 88,
-        pointerId: 1,
-        pointerType: 'mouse',
-      })
-      fireSelectionPointerEvent(assistantText, 'up', {
-        button: 0,
-        clientX: 260,
-        clientY: 104,
-        pointerId: 1,
-        pointerType: 'mouse',
-      })
-      fireSelectionPointerEvent(assistantText, 'down', {
-        button: 2,
-        clientX: 240,
-        clientY: 96,
-        pointerId: 2,
-        pointerType: 'mouse',
-      })
-      fireSelectionPointerEvent(assistantText, 'up', {
-        button: 2,
-        clientX: 240,
-        clientY: 96,
-        pointerId: 2,
-        pointerType: 'mouse',
-      })
-      fireEvent.mouseUp(assistantText, { button: 2, clientX: 240, clientY: 96 })
-      fireEvent.contextMenu(assistantText, { clientX: 240, clientY: 96 })
-    })
+    const assistantText = screen.getByText(/Right-click without a selection/)
+    window.getSelection()?.removeAllRanges()
+    const contextMenuEvent = createEvent.contextMenu(assistantText, { clientX: 240, clientY: 96 })
+    fireEvent(assistantText, contextMenuEvent)
     await waitForSelectionMenuUpdate()
 
+    expect(contextMenuEvent.defaultPrevented).toBe(false)
     expect(screen.queryByRole('button', { name: 'Add to chat' })).toBeNull()
-    expect(window.getSelection()?.toString()).toBe('copy this selected reply')
   })
 
-  it('dismisses Add to chat on right-click without clearing the selected text', async () => {
+  it('opens the selection actions at the right-click point without clearing the text', async () => {
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
@@ -4165,20 +4136,15 @@ describe('MessageList nested tool calls', () => {
 
     const assistantText = screen.getByText(/Selected text must remain copyable/)
     await selectMessageText(assistantText, 'remain copyable')
-    expect(screen.getByRole('button', { name: 'Add to chat' })).toBeTruthy()
 
     await act(async () => {
-      fireSelectionPointerEvent(assistantText, 'down', {
-        button: 2,
-        clientX: 260,
-        clientY: 104,
-        pointerId: 2,
-        pointerType: 'mouse',
-      })
       fireEvent.contextMenu(assistantText, { clientX: 260, clientY: 104 })
     })
+    await waitForSelectionMenuUpdate()
 
-    expect(screen.queryByRole('button', { name: 'Add to chat' })).toBeNull()
+    const addButton = screen.getByRole('button', { name: 'Add to chat' })
+    expect((addButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('260px')
+    expect((addButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('104px')
     expect(window.getSelection()?.toString()).toBe('remain copyable')
   })
 
@@ -4222,6 +4188,7 @@ describe('MessageList nested tool calls', () => {
         pointerId: 1,
         pointerType: 'mouse',
       })
+      fireEvent.contextMenu(assistantText, { clientX: 320, clientY: 100 })
       await Promise.resolve()
     })
     await waitForSelectionMenuUpdate()
@@ -4229,14 +4196,14 @@ describe('MessageList nested tool calls', () => {
     expect(screen.getByRole('button', { name: 'Add to chat' })).toBeTruthy()
   })
 
-  it('places the selected-message action to the right when there is no room above', async () => {
+  it('keeps the context menu inside the viewport near the edges', async () => {
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
           messages: [{
             id: 'assistant-1',
             type: 'assistant_text',
-            content: 'Top edge selections need a nearby right-side action.',
+            content: 'Selections near the edge still get a usable menu.',
             timestamp: 1,
           }],
         }),
@@ -4245,21 +4212,18 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
-    const assistantText = screen.getByText(/Top edge selections/)
-    await selectMessageText(assistantText, 'right-side action', {
-      left: 160,
-      top: 18,
-      right: 280,
-      bottom: 36,
-      width: 120,
-      height: 18,
-      x: 160,
-      y: 18,
-    })
+    const assistantText = screen.getByText(/Selections near the edge/)
+    await selectMessageText(
+      assistantText,
+      'near the edge',
+      {},
+      { clientX: 5000, clientY: 5000 },
+    )
     const floatingAddButton = screen.getByRole('button', { name: 'Add to chat' })
 
-    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('290px')
-    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('12px')
+    // 1024x768 viewport minus the 200x88 menu and the 12px margin.
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('812px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('668px')
   })
 
   it('adds multi-line assistant reply selections across markdown blocks to the composer context', async () => {
@@ -4295,8 +4259,8 @@ describe('MessageList nested tool calls', () => {
     )
     const floatingAddButton = screen.getByRole('button', { name: 'Add to chat' })
 
-    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('530px')
-    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('129px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('240px')
+    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('120px')
 
     fireEvent.click(floatingAddButton)
 
@@ -4309,128 +4273,6 @@ describe('MessageList nested tool calls', () => {
     ])
     expect(useWorkspaceChatContextStore.getState().referencesBySession[ACTIVE_TAB]?.[0]?.quote).toContain('First line')
     expect(useWorkspaceChatContextStore.getState().referencesBySession[ACTIVE_TAB]?.[0]?.quote).toContain('finish the selection')
-  })
-
-  it('floats a multi-line selection above the text when the placement preference asks for it', async () => {
-    useSelectionMenuPlacementStore.setState({ placement: 'above' })
-    useChatStore.setState({
-      sessions: {
-        [ACTIVE_TAB]: makeSessionState({
-          messages: [{
-            id: 'assistant-1',
-            type: 'assistant_text',
-            content: [
-              'First line can start the selection.',
-              '',
-              'Second paragraph should still belong to the same chat message.',
-              '',
-              '- Third block can finish the selection.',
-            ].join('\n'),
-            timestamp: 1,
-          }],
-        }),
-      },
-    })
-
-    render(<MessageList />)
-
-    await selectAcrossMessageText(
-      screen.getByText('First line can start the selection.'),
-      'First line',
-      screen.getByText('Third block can finish the selection.'),
-      'finish the selection',
-      { left: 160, top: 80, right: 520, bottom: 160, width: 360, height: 80 },
-    )
-    const floatingAddButton = screen.getByRole('button', { name: 'Add to chat' })
-
-    // Above the whole selection (top 80 - 44 - 10) and centred on it, instead of
-    // over the text that follows the selection.
-    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.left).toBe('160px')
-    expect((floatingAddButton.closest('[role=toolbar]') as HTMLElement).style.top).toBe('26px')
-  })
-
-  it('shows the selected-message action after browser selectionchange for multi-line replies', async () => {
-    useChatStore.setState({
-      sessions: {
-        [ACTIVE_TAB]: makeSessionState({
-          messages: [{
-            id: 'assistant-1',
-            type: 'assistant_text',
-            content: [
-              'Browser selection can settle after pointerup.',
-              '',
-              'The document selectionchange event should be enough to show the action.',
-            ].join('\n'),
-            timestamp: 1,
-          }],
-        }),
-      },
-    })
-
-    render(<MessageList />)
-
-    const firstParagraph = screen.getByText('Browser selection can settle after pointerup.')
-    const secondParagraph = screen.getByText('The document selectionchange event should be enough to show the action.')
-    const startNode = findTextNodeContaining(firstParagraph, 'Browser selection')
-    const endNode = findTextNodeContaining(secondParagraph, 'show the action')
-    const range = document.createRange()
-    range.setStart(startNode, startNode.textContent?.indexOf('Browser selection') ?? 0)
-    range.setEnd(
-      endNode,
-      (endNode.textContent?.indexOf('show the action') ?? 0) + 'show the action'.length,
-    )
-    Object.assign(range, {
-      getBoundingClientRect: () => ({
-        left: 150,
-        top: 76,
-        right: 500,
-        bottom: 140,
-        width: 350,
-        height: 64,
-        x: 150,
-        y: 76,
-        toJSON: () => ({}),
-      }),
-    })
-
-    const selectableRoot = firstParagraph.closest('[data-chat-selectable-message]')
-    Object.assign(selectableRoot ?? firstParagraph, {
-      getBoundingClientRect: () => ({
-        left: 120,
-        top: 48,
-        right: 720,
-        bottom: 280,
-        width: 600,
-        height: 232,
-        x: 120,
-        y: 48,
-        toJSON: () => ({}),
-      }),
-    })
-
-    window.getSelection()?.removeAllRanges()
-    window.getSelection()?.addRange(range)
-
-    await act(async () => {
-      fireSelectionPointerEvent(firstParagraph, 'down', {
-        button: 0,
-        clientX: 150,
-        clientY: 76,
-        pointerId: 1,
-        pointerType: 'mouse',
-      })
-      fireSelectionPointerEvent(secondParagraph, 'up', {
-        button: 0,
-        clientX: 500,
-        clientY: 140,
-        pointerId: 1,
-        pointerType: 'mouse',
-      })
-      document.dispatchEvent(new Event('selectionchange'))
-    })
-    await waitForSelectionMenuUpdate()
-
-    expect(screen.getByRole('button', { name: 'Add to chat' })).toBeTruthy()
   })
 
   it('adds selected assistant reply text to the composer context', async () => {
