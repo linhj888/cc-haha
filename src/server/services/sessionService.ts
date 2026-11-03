@@ -1,3 +1,5 @@
+import { DesktopUiPreferencesService } from './desktopUiPreferencesService.js'
+import { normalizeAdditionalDirectories, validateProjectAdditionalDirectories } from './projectDirectories.js'
 import { getSideChat, isSideChatId, sideChatSummary } from './sideChatRegistry.js'
 import { splitSessionReferenceContext } from './sessionReferenceContext.js'
 import { parseSessionCollaborationEnvelope } from '../../utils/sessionCollaborationEnvelope.js'
@@ -202,6 +204,7 @@ export type SessionDetail = SessionListItem & {
 }
 
 export type SessionLaunchInfo = {
+  additionalDirectories?: string[]
   filePath: string
   projectDir: string
   workDir: string
@@ -706,6 +709,7 @@ const USER_INTERRUPTION_TEXTS = new Set([
 const NO_RESPONSE_REQUESTED_TEXT = 'No response requested.'
 const TASK_NOTIFICATION_RE = /^<task-notification>\s*[\s\S]*<\/task-notification>$/i
 const TASK_NOTIFICATION_BLOCK_RE = /<task-notification>\s*[\s\S]*?<\/task-notification>/i
+const TASK_NOTIFICATION_BLOCKS_RE = /<task-notification>\s*[\s\S]*?<\/task-notification>/gi
 const PERSISTED_TASK_NOTIFICATION_ENTRY_TYPE = 'cc-haha-task-notification'
 const PROVIDER_MODEL_ALIAS_SEPARATORS = ['-', '_', ':', '/', '.', ' ']
 
@@ -1185,6 +1189,7 @@ export class SessionService {
     metadata: {
       workDir: string
       repository?: PreparedSessionWorkspace['repository']
+      additionalDirectories?: string[]
       permissionMode?: string
       runtimeProviderId?: string | null
       runtimeModelId?: string
@@ -1193,6 +1198,7 @@ export class SessionService {
     },
   ): boolean {
     if (!launchInfo) return false
+    if (metadata.additionalDirectories !== undefined && JSON.stringify(launchInfo.additionalDirectories ?? []) !== JSON.stringify(metadata.additionalDirectories)) return false
     if (normalizeDriveRootPathForPlatform(launchInfo.workDir) !== metadata.workDir) {
       return false
     }
@@ -1493,6 +1499,7 @@ export class SessionService {
     if (pending) return pending
     const request = withHistoryReadBudget(undefined, async () => {
       const makeState = () => ({
+        additionalDirectories: undefined as string[] | undefined,
         workDir: undefined as string | undefined, cwd: undefined as string | undefined,
         repository: undefined as PreparedSessionWorkspace['repository'] | undefined,
         worktreeSession: undefined as PersistedWorktreeSession | null | undefined,
@@ -1519,6 +1526,7 @@ export class SessionService {
         const record = entry as Record<string, unknown>
         if (record.entrypoint === 'claude-desktop-team-worker') state.isTeamWorker = true
         if (entry.type === 'session-meta') {
+          if (record.additionalDirectories !== undefined) state.additionalDirectories = normalizeAdditionalDirectories(record.additionalDirectories)
           if (entry.agentProfile === 'standard' || entry.agentProfile === 'lean') state.agentProfile = entry.agentProfile
           if (typeof record.workDir === 'string') state.workDir = normalizeDriveRootPathForPlatform(record.workDir)
           state.permissionMode = this.resolvePermissionModeFromEntries([entry]) ?? state.permissionMode
@@ -1546,6 +1554,7 @@ export class SessionService {
         if (completeLine) apply(summary, entry as RawEntry)
       })
       const shared = (state: typeof summary) => ({
+        ...(state.additionalDirectories !== undefined ? { additionalDirectories: state.additionalDirectories } : {}),
         agentProfile: state.agentProfile,
         ...(state.permissionMode ? { permissionMode: state.permissionMode } : {}),
         ...(state.runtimeProviderId !== undefined ? { runtimeProviderId: state.runtimeProviderId } : {}),
@@ -2263,6 +2272,36 @@ export class SessionService {
   private readXmlTag(xml: string, tag: string): string | undefined {
     const match = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'))
     return match?.[1] ? this.decodeXmlText(match[1].trim()) : undefined
+  }
+
+  /**
+   * A <task-notification> user entry is the prompt of a turn the user did not
+   * start: one idle notification, or the isMeta batch of settled agents.
+   * Notifications drained mid-turn are attachments and never get here. Like
+   * generation_stopped, project it as a status so history keeps why the reply
+   * that follows exists, without the model-facing XML.
+   */
+  private backgroundContinueEntryToMessage(entry: RawEntry): MessageEntry | null {
+    if (entry.type !== 'user' || entry.message?.role !== 'user') return null
+    const content = entry.message.content
+    if (!this.isTaskNotificationContent(content)) return null
+    const notifications = this.extractTextBlocks(content)
+      .flatMap((text) => text.match(TASK_NOTIFICATION_BLOCKS_RE) ?? [])
+      .map((xml) => {
+        const rawStatus = this.readXmlTag(xml, 'status')
+        const summary = this.readXmlTag(xml, 'summary')
+        return {
+          taskId: this.readXmlTag(xml, 'task-id') || this.readXmlTag(xml, 'tool-use-id') || '',
+          ...(rawStatus ? { status: rawStatus === 'killed' ? 'stopped' : rawStatus } : {}),
+          ...(summary ? { summary } : {}),
+        }
+      })
+    return {
+      id: entry.uuid || crypto.randomUUID(),
+      type: 'system',
+      content: { subtype: 'background_continue', notifications },
+      timestamp: entry.timestamp || new Date().toISOString(),
+    }
   }
 
   private parseTaskNotificationContent(
@@ -2994,14 +3033,19 @@ export class SessionService {
 
   private async findSessionFilesFromFiles(
     sessionId: string,
+    strict = false,
   ): Promise<Array<{ filePath: string; projectDir: string }>> {
-
+    const onReadError = (error: unknown): 'drop' => {
+      if (strict && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      return 'drop'
+    }
     const projectsDir = this.getProjectsDir()
     let projectDirs: string[]
 
     try {
       projectDirs = await fs.readdir(projectsDir)
-    } catch {
+    } catch (error) {
+      onReadError(error)
       return []
     }
 
@@ -3009,14 +3053,19 @@ export class SessionService {
     for (const dir of projectDirs) {
       const filePath = path.join(projectsDir, dir, `${sessionId}.jsonl`)
       try {
+        // Project roots can contain ordinary files. They are not uncertain
+        // directories, and must not turn a strict absence check into ENOTDIR.
+        if (strict && !(await fs.stat(path.join(projectsDir, dir))).isDirectory()) continue
         const stat = await fs.stat(filePath)
+        if (strict && !stat.isFile()) throw Object.assign(new Error('Session transcript is not a regular file'), { code: 'INVALID_SESSION_TRANSCRIPT' })
         matches.push({ filePath, projectDir: dir, mtimeMs: stat.mtimeMs })
-      } catch {
+      } catch (error) {
+        onReadError(error)
         continue
       }
     }
 
-    const ranked = await this.rankSessionFileMatches(matches, () => 'drop')
+    const ranked = await this.rankSessionFileMatches(matches, onReadError)
     return ranked!.map(({ filePath, projectDir }) => ({ filePath, projectDir }))
   }
 
@@ -3025,6 +3074,16 @@ export class SessionService {
   ): Promise<{ filePath: string; projectDir: string } | null> {
     if (isSideChatId(sessionId)) return null
     return (await this.findSessionFiles(sessionId))[0] ?? null
+  }
+
+  /** Authoritative absence for decision cleanup; UI/index fallbacks stay forgiving. */
+  async hasSessionStrict(sessionId: string): Promise<boolean> {
+    if (isSideChatId(sessionId)) {
+      const side = getSideChat(sessionId)
+      return !!side && !side.closed
+    }
+    if (!this.isValidSessionId(sessionId)) return false
+    return (await this.findSessionFilesFromFiles(sessionId, true)).length > 0
   }
 
   private isValidSessionId(id: string): boolean {
@@ -3423,6 +3482,7 @@ export class SessionService {
     let latestCwd: string | null = null
     let repository: PreparedSessionWorkspace['repository'] | undefined
     let worktreeSession: PersistedWorktreeSession | null | undefined
+    let additionalDirectories: string[] = []
     let agentProfile: 'standard' | 'lean' = 'standard'
     let permissionMode: string | undefined
     let runtimeProviderId: string | null | undefined
@@ -3463,6 +3523,7 @@ export class SessionService {
       if (entry.type === 'session-meta') {
         if (entry.agentProfile === 'standard' || entry.agentProfile === 'lean') agentProfile = entry.agentProfile
         const record = entry as Record<string, unknown>
+        if (record.additionalDirectories !== undefined) additionalDirectories = normalizeAdditionalDirectories(record.additionalDirectories)
         if (typeof record.workDir === 'string') {
           latestWorkDir = normalizeDriveRootPathForPlatform(record.workDir)
         }
@@ -3610,6 +3671,7 @@ export class SessionService {
 
     const workDir = latestWorkDir || latestCwd || this.desanitizePath(found.projectDir) || process.cwd()
     const launchInfo: SessionLaunchInfo = {
+      additionalDirectories,
       filePath: found.filePath,
       projectDir: found.projectDir,
       workDir,
@@ -4905,6 +4967,8 @@ export class SessionService {
       sessionId,
     )
     const absWorkDir = preparedWorkspace.workDir
+    const { additionalDirectories: configuredDirectories } = await new DesktopUiPreferencesService().getProjectDirectories(absWorkDir)
+    const additionalDirectories = await validateProjectAdditionalDirectories(absWorkDir, configuredDirectories)
     registerFilesystemAccessRoot(absWorkDir)
     console.log(
       `[SessionService] createSession: requested workDir=${JSON.stringify(
@@ -4939,6 +5003,7 @@ export class SessionService {
     const metaEntry = {
       type: 'session-meta',
       isMeta: true,
+      additionalDirectories,
       workDir: absWorkDir,
       agentProfile,
       repository: preparedWorkspace.repository,
@@ -4949,7 +5014,7 @@ export class SessionService {
     }
 
     if (!persist || !this.shouldPersistSession()) this.memoryLaunchInfo.set(this.memorySessionKey(sessionId), {
-      filePath, projectDir: sanitized, workDir: absWorkDir,
+      filePath, projectDir: sanitized, workDir: absWorkDir, additionalDirectories,
       repository: preparedWorkspace.repository, transcriptMessageCount: 0,
       customTitle: null,
       agentProfile,
@@ -5117,15 +5182,15 @@ export class SessionService {
   async getSessionLaunchInfo(sessionId: string): Promise<SessionLaunchInfo | null> {
     if (isSideChatId(sessionId)) {
       const side = getSideChat(sessionId)
-      return side && !side.closed ? { ...side.launchInfo } : null
+      return side && !side.closed ? { ...side.launchInfo, additionalDirectories: [...(side.launchInfo.additionalDirectories ?? [])] } : null
     }
     const memory = this.memoryLaunchInfo.get(this.memorySessionKey(sessionId))
     const found = await this.findSessionFile(sessionId)
-    if (!found) return memory ? { ...memory, transcriptMessageCount: 0 } : null
+    if (!found) return memory ? { ...memory, additionalDirectories: [...(memory.additionalDirectories ?? [])], transcriptMessageCount: 0 } : null
 
     const projection = await this.getMetadataProjection(found.filePath, found.projectDir)
     const projected = projection.launchInfo
-    return { ...projected, ...memory, transcriptMessageCount: projected.transcriptMessageCount }
+    return { ...projected, ...memory, additionalDirectories: [...(memory?.additionalDirectories ?? projected.additionalDirectories ?? [])], transcriptMessageCount: projected.transcriptMessageCount }
   }
 
   async deleteSessionFile(sessionId: string): Promise<void> {
@@ -5299,6 +5364,7 @@ export class SessionService {
     metadata: {
       workDir: string
       customTitle?: string | null
+      additionalDirectories?: string[]
       repository?: PreparedSessionWorkspace['repository']
       permissionMode?: string
       runtimeProviderId?: string | null
@@ -5319,6 +5385,7 @@ export class SessionService {
     }
     const persist = this.shouldPersistSession()
     const storedInfo = await this.getSessionLaunchInfo(sessionId)
+    let additionalDirectories = normalizeAdditionalDirectories(metadata.additionalDirectories ?? storedInfo?.additionalDirectories)
     if (storedInfo?.agentProfile === 'lean' && metadata.permissionMode === 'plan') throw new Error('Plan mode is unavailable in lean sessions. Choose another permission mode.')
     if (storedInfo) this.knownSessionKeys.add(this.memorySessionKey(sessionId))
     const workDir = normalizeDriveRootPathForPlatform(metadata.workDir)
@@ -5332,6 +5399,7 @@ export class SessionService {
       const projectDir = this.sanitizePath(normalizedWorkDir)
       this.memoryLaunchInfo.set(this.memorySessionKey(sessionId), {
         ...previousInfo,
+        additionalDirectories,
         workDir: normalizedWorkDir, projectDir,
         filePath: path.join(this.getProjectsDir(), projectDir, `${sessionId}.jsonl`),
         ...(metadata.repository ? { repository: metadata.repository } : {}),
@@ -5378,6 +5446,29 @@ export class SessionService {
       }
     }
 
+    // The CLI can create its worktree transcript before system/init arrives.
+    // That conversation wins file selection, but its launch snapshot still lives
+    // in the placeholder until this write transfers it before placeholder cleanup.
+    const target = matches.find((match) => match.filePath === targetFilePath)
+    const targetDirectories = target
+      ? (await this.getMetadataProjection(target.filePath, target.projectDir)).launchInfo.additionalDirectories
+      : undefined
+    let scopeNeedsTransfer = metadata.additionalDirectories !== undefined && targetDirectories === undefined
+    if (metadata.additionalDirectories === undefined) {
+      if (targetDirectories !== undefined) {
+        additionalDirectories = [...targetDirectories]
+      } else {
+        for (const match of matches) {
+          const candidate = (await this.getMetadataProjection(match.filePath, match.projectDir)).launchInfo.additionalDirectories
+          if (candidate !== undefined) {
+            additionalDirectories = [...candidate]
+            scopeNeedsTransfer = true
+            break
+          }
+        }
+      }
+    }
+
     // Startup names the directory the session was launched from, so a
     // collaboration title can land on that placeholder. Once the conversation
     // lives in another transcript, keep the title with the file that survives
@@ -5400,9 +5491,10 @@ export class SessionService {
       }
     }
 
-    if (!customTitle && !this.memoryLaunchInfo.has(this.memorySessionKey(sessionId))) {
+    if (!scopeNeedsTransfer && !customTitle && !this.memoryLaunchInfo.has(this.memorySessionKey(sessionId))) {
       if (this.metadataMatchesLaunchInfo(previousInfo, {
         ...metadata,
+        additionalDirectories,
         workDir: normalizedWorkDir,
         repository,
       })) {
@@ -5416,6 +5508,7 @@ export class SessionService {
       type: 'session-meta',
       isMeta: true,
       workDir: normalizedWorkDir,
+      additionalDirectories,
       agentProfile: storedInfo?.agentProfile ?? 'standard',
       repository,
       ...(metadata.permissionMode && VALID_SESSION_PERMISSION_MODES.has(metadata.permissionMode)
@@ -5878,14 +5971,21 @@ export class SessionService {
       // Only process transcript entries (user / assistant / system with messages)
       if (!entry.message?.role) continue
 
+      // Checked before the isMeta skip: the batch of settled agents is isMeta.
+      const backgroundContinue = this.backgroundContinueEntryToMessage(entry)
+      if (backgroundContinue) {
+        messages.push(backgroundContinue)
+        continue
+      }
+
       // Skip meta entries (CLI internal bookkeeping). Collaboration deliveries
       // are the exception: the isMeta prompt carries a real cross-session
       // message that must render as an ordinary user-position bubble.
       if (entry.isMeta && !parseSessionCollaborationEnvelope(entry.message.content)) continue
 
-      // The queued <task-notification> turn is system plumbing and is hidden here (the
-      // Activity cards come from its notification data). What the assistant does in
-      // response is ordinary conversation, so it is never dropped with it.
+      // Anything else hidden here is system plumbing. What the assistant does in
+      // response to a projected notification is ordinary conversation, so it is
+      // never dropped with it.
       if (this.shouldHideTranscriptEntry(entry)) continue
 
       // Skip non-transcript entry types
